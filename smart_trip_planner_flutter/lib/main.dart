@@ -1,10 +1,18 @@
 import 'package:flutter/material.dart';
-import 'package:smart_trip_planner_flutter/presentation/auth/login.dart';
-import 'package:smart_trip_planner_flutter/presentation/auth/signUp.dart';
-import 'package:smart_trip_planner_flutter/presentation/home/TripPlannerScreen.dart';
-import 'package:smart_trip_planner_flutter/presentation/home/itinerary.dart';
+import 'package:isar/isar.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:smart_trip_planner_flutter/presentation/home/HomeScreen.dart';
+import 'package:smart_trip_planner_flutter/presentation/home/itineraryScreen.dart';
 
-void main() {
+import 'data/model/itinerary.dart';
+
+
+late Isar isar;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final dir = await getApplicationDocumentsDirectory();
+  isar = await Isar.open([ItinerarySchema], directory: dir.path);
   runApp(const MyApp());
 }
 
@@ -18,7 +26,7 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: ItineraryScreen(),
+      home: HomeScreen(),
     );
   }
 }

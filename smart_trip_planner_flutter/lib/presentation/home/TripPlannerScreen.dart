@@ -23,7 +23,7 @@ class _TripPlannerScreenState extends State<TripPlannerScreen> {
       _response = null;
     });
 
-    const apiKey = "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";
+    const apiKey = "";
     const url = "https://api.groq.com/openai/v1/chat/completions";
 
     final response = await http.post(
