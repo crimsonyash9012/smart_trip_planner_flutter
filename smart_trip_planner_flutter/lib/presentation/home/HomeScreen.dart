@@ -30,7 +30,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("My Trips"),
+        title: const Text("My Trips",
+        style: TextStyle(
+          color: Colors.white
+        ),),
         backgroundColor: const Color(0xFF2E6D4D),
       ),
       body: itineraries.isEmpty
@@ -56,9 +59,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (_) => ItineraryScreen(),
+                    builder: (_) => ItineraryScreen(itinerary: trip),
                   ),
-                );
+                ).then((_) => _loadItineraries());
               },
             ),
           );
@@ -69,7 +72,9 @@ class _HomeScreenState extends State<HomeScreen> {
         onPressed: () {
           Navigator.push(
             context,
-            MaterialPageRoute(builder: (_) => const ItineraryScreen()),
+            MaterialPageRoute(
+              builder: (_) => const ItineraryScreen(),
+            ),
           ).then((_) => _loadItineraries());
         },
         child: const Icon(Icons.add, color: Colors.white),

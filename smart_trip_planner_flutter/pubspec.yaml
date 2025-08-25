@@ -21,6 +21,7 @@ dependencies:
   isar_flutter_libs:
     path: ./local_packages/isar_flutter_libs
   json_annotation: ^4.9.0
+  json5: ^0.8.2
 
 dev_dependencies:
   flutter_test:
@@ -31,3 +32,6 @@ dev_dependencies:
   json_serializable: ^6.6.2
   build_runner: ^2.4.6
   isar_generator: ^3.1.0+1
+
+flutter:
+  uses-material-design: true

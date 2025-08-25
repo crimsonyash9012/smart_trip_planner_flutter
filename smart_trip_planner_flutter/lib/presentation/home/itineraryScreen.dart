@@ -1,81 +1,129 @@
 import 'dart:convert';
 import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
-import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../data/model/itinerary.dart';
 import '../../main.dart';
 
+const String _systemPrompt = """
+You are a smart trip planner assistant.
+
+Rules:
+1. Your ONLY output must be valid JSON following this schema:
+
+{
+  "title": "Trip Title",
+  "startDate": "YYYY-MM-DD",
+  "endDate": "YYYY-MM-DD",
+  "days": [
+    {
+      "date": "YYYY-MM-DD",
+      "summary": "Day summary",
+      "items": [
+        { "time": "HH:MM", "activity": "Activity description", "location": "lat,lng" }
+      ]
+    }
+  ],
+  "hotels": [
+    { "name": "Hotel name", "pricePerNight": 100, "location": "lat,lng" }
+  ],
+  "touristSpots": [
+    { "name": "Spot name", "location": "lat,lng", "description": "Short description" }
+  ],
+  "food": [
+    { "name": "Restaurant or street food", "cuisine": "Indian/Italian/etc", "avgCost": 15, "location": "lat,lng" }
+  ],
+  "transportOptions": [
+    { "mode": "flight/train/bus/cab", "provider": "Airline/Bus/Taxi/etc", "approxCost": 50, "duration": "2h 30m" }
+  ],
+  "estimatedBudget": {
+    "currency": "INR",
+    "accommodation": 0,
+    "food": 0,
+    "transport": 0,
+    "activities": 0,
+    "total": 0
+  }
+}
+
+2. Do NOT include Markdown, explanations, or extra text. Only return valid JSON.
+3. Every `location` must be in "lat,lng" format.
+4. All budget numbers must be realistic estimates in Indian Rupees (not all zeros).
+5. "hotels", "touristSpots", "food", "transportOptions", and "estimatedBudget" are required but can be empty arrays/objects if not applicable.
+""";
+
+String? _extractJson(String text) {
+  final start = text.indexOf("{");
+  final end = text.lastIndexOf("}");
+  if (start != -1 && end != -1 && end > start) {
+    return text.substring(start, end + 1);
+  }
+  return null;
+}
+
+String _repairJson(String jsonStr) {
+  return jsonStr
+      .replaceAllMapped(RegExp(r'"(\w+)"\s*,\s*'), (m) => '"${m[1]}": ')
+      .replaceAll(",}", "}")
+      .replaceAll(",]", "]");
+}
+
+/// Helper to open coordinates in Maps
+/// Try to launch a Uri; returns true if something opened.
+Future<bool> _launch(Uri uri) async {
+  if (await canLaunchUrl(uri)) {
+    return await launchUrl(uri, mode: LaunchMode.externalApplication);
+  }
+  return false;
+}
+
+/// Open coordinates in Maps (native first, then web)
+Future<void> _openInMaps(String latLng, {String? label}) async {
+  final clean = latLng.replaceAll(' ', '');
+  final q = label == null ? clean : '$clean($label)';
+
+  final attempts = <Uri>[
+    if (Platform.isIOS) Uri.parse('maps://?q=$q'), // Apple Maps (app)
+    if (Platform.isAndroid) Uri.parse('geo:$clean?q=$q'), // Any maps app
+    Uri.https('www.google.com', '/maps/search/', {'api': '1', 'query': q}),
+    Uri.https('maps.apple.com', '/', {'q': q}),
+  ];
+
+  for (final u in attempts) {
+    if (await _launch(u)) return;
+  }
+}
+
+/// Open route from current location → destination
+Future<void> _openRouteInMaps(String destinationLatLng) async {
+  final dest = destinationLatLng.replaceAll(' ', '');
+
+  final attempts = <Uri>[
+    if (Platform.isIOS)
+      Uri.parse('maps://?daddr=$dest&dirflg=d'), // Apple Maps driving
+    if (Platform.isAndroid)
+      Uri.parse('google.navigation:q=$dest&mode=d'), // Google Maps nav
+    Uri.https('www.google.com', '/maps/dir/', {
+      'api': '1',
+      'destination': dest,
+    }),
+    Uri.https('maps.apple.com', '/', {'daddr': dest, 'dirflg': 'd'}),
+  ];
+
+  for (final u in attempts) {
+    if (await _launch(u)) return;
+  }
+}
+
 class ItineraryScreen extends StatefulWidget {
-  const ItineraryScreen({super.key});
+  final Itinerary? itinerary;
+  const ItineraryScreen({super.key, this.itinerary});
 
   @override
   State<ItineraryScreen> createState() => _ItineraryScreenState();
 }
-
-String _fixMapLinks(String text) {
-  var t = text;
-
-  // 0) Normalize http(s)://maps:// -> maps://
-  t = t.replaceAll(RegExp(r'https?:\/\/maps:\/\/', caseSensitive: false), 'maps://');
-
-  // 1) Turn: "Hotel Hans Plaza (maps://Hotel Hans Plaza)" -> "[Hotel Hans Plaza](maps://Hotel Hans Plaza)"
-  t = t.replaceAllMapped(
-    RegExp(r'(?<!\])\b([^\[\]\(]+?)\s*\(\s*maps:\/\/([^)]+)\s*\)'),
-        (m) {
-      final label = m.group(1)!.trim().replaceAll(RegExp(r'[\s\.,;:]+$'), '');
-      final href  = m.group(2)!.trim();
-      return '[$label](maps://$href)';
-    },
-  );
-
-  // 2) Normalize already-linked forms like: "[Place] (maps://Place)" -> "[Place](maps://Place)"
-  t = t.replaceAllMapped(
-    RegExp(r'\[([^\]]+)\]\s*\(\s*maps:\/\/([^)]+)\s*\)'),
-        (m) => '[${m.group(1)!.trim()}](maps://${m.group(2)!.trim()})',
-  );
-
-  // 3) Unwrap stray parentheses around a proper link: "([Place](maps://...))" -> "[Place](maps://...)"
-  t = t.replaceAllMapped(
-    RegExp(r'\(\s*(\[[^\]]+\]\(maps:\/\/[^)]+\))\s*\)'),
-        (m) => m.group(1)!,
-  );
-
-  // 4) Remove accidental duplicated “(maps://...)” after a link
-  t = t.replaceAll(RegExp(r'\)\(maps:\/\/[^\)]+\)'), ')');
-
-  // 5) Remove leftover “$1”, “$2”… (but keep real money amounts)
-  t = t.replaceAll(RegExp(r'(?<=\]\(maps:\/\/[^)]+\))\s*\$[0-9]+\b'), '');
-
-  // 6) Remove duplicate plain text before links:
-  //    "Tokyo Station [Tokyo Station](maps://Tokyo Station)" -> "[Tokyo Station](maps://Tokyo Station)"
-  t = t.replaceAllMapped(
-    RegExp(r'(\b([^\[]+?)\s*)\[\2\]\(maps:\/\/([^)]+)\)'),
-        (m) => '[${m.group(2)!.trim()}](maps://${m.group(3)!.trim()})',
-  );
-
-  return t;
-}
-
-String _autoLinkKnownPlaces(String text) {
-  // Find all linked place names
-  final linkedPlaceRegex = RegExp(r'\[([^\]]+)\]\(maps:\/\/[^\)]+\)');
-  final linkedPlaces = linkedPlaceRegex.allMatches(text).map((m) => m.group(1)!).toSet();
-
-  // For each place, replace plain text occurrences with Markdown links if not already linked
-  for (final place in linkedPlaces) {
-    // Match place not inside link: (?<!\[)Place Name(?!\]\(maps://)
-    // Only replace if not inside square brackets (already linked)
-    text = text.replaceAllMapped(
-      RegExp(r'(?<![\]\)])\b' + RegExp.escape(place) + r'\b(?![\(\]])'),
-          (m) => '[${m.group(0)}](maps://${m.group(0)})',
-    );
-  }
-  return text;
-}
-
 
 class _ItineraryScreenState extends State<ItineraryScreen> {
   final TextEditingController _tripController = TextEditingController();
@@ -84,59 +132,77 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
   List<Map<String, String>> _messages = [];
   String? _response;
   bool _isLoading = false;
-  bool _showFollowUpBox = false;
+  // Live suggestions picked by Groq from Google top 5 results
+  Map<String, Map<String, dynamic>> _livePicks = {};
 
-  String? _origin;
-  String? _destination;
-  List<String> _waypoints = [];
+  // Google API Key (provided by user)
+  static const String _googleApiKey =
+      '';
+
+  Future<void> _deleteCurrentItinerary() async {
+    final it = widget.itinerary;
+    if (it == null) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this itinerary?'),
+        content: Text('"${it.title}" will be permanently deleted.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await isar.writeTxn(() async {
+        await isar.itinerarys.delete(it.id);
+      });
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Itinerary deleted')),
+      );
+      Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _messages = [
+      {"role": "system", "content": _systemPrompt},
+    ];
+    if (widget.itinerary != null) {
+      _response = widget.itinerary!.content;
+      _tripController.text = widget.itinerary!.title;
+      _messages.addAll([
+        {"role": "user", "content": widget.itinerary!.title},
+        {"role": "assistant", "content": _response!},
+      ]);
+      // Kick off live searches for saved itinerary
+      try {
+        final itJson = jsonDecode(_response!);
+        _runLiveSearches(itJson);
+      } catch (_) {}
+    }
+  }
 
   Future<void> _getTripPlan({String? followUp}) async {
-    setState(() {
-      _isLoading = true;
-      if (followUp == null) {
-        _response = null;
-        _origin = null;
-        _destination = null;
-        _waypoints.clear();
-      }
-    });
+    setState(() => _isLoading = true);
 
-    const apiKey = "";
+    const apiKey =
+        ""; // <-- replace
     const url = "https://api.groq.com/openai/v1/chat/completions";
 
     if (followUp == null) {
-      _messages = [
-        {
-          "role": "system",
-          "content": """
-            You are a smart trip planner assistant.
-            
-            Rules:
-            1. All section titles must be in Markdown headings (#, ##, ###).
-            2. All important details (dates, times, costs, names) must be in **bold**.
-            3. Every place (restaurant, airport, hotel, tourist attraction) MUST be wrapped as a Markdown hyperlink like this:
-               [Place Name](maps://Place Name)
-               Example: Visit [Eiffel Tower](maps://Eiffel Tower).
-            4. At the end, clearly write:
-               Start: <starting location>
-               End: <ending location>
-            5. Every place MUST be written as exactly one Markdown link:
-                [Place Name](maps://Place Name)
-                
-            6. Do not write duplicate (maps://...) after the link.
-            7. Do not wrap links in extra parentheses.   
-            
-            When generating itineraries:
-            1. Identify where real-time info is needed (e.g., "best restaurants in Kyoto", "top hotels near Shinjuku").
-            2. Instead of guessing, return a JSON request like: SEARCH: {"query": "best restaurants in Kyoto"}
-            3. The app will execute the search (via Google Places API, Yelp, or Groq Web Search), then feed results back to you.
-            4. After receiving results, include them in the itinerary.
-            5. Final output must follow Markdown formatting rules with [Place](maps://Place).
-        
-            """,
-        },
-        {"role": "user", "content": _tripController.text.trim()},
-      ];
+      _messages.add({"role": "user", "content": _tripController.text.trim()});
     } else {
       _messages.add({"role": "user", "content": followUp});
     }
@@ -148,432 +214,463 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           "Authorization": "Bearer $apiKey",
           "Content-Type": "application/json",
         },
-        body: jsonEncode({"model": "llama3-8b-8192", "messages": _messages}),
+        body: jsonEncode({
+          "model": "llama-3.3-70b-versatile",
+          "messages": _messages,
+        }),
       );
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+
+        if (data.containsKey("error")) {
+          setState(() {
+            _response = "API Error: ${data["error"]["message"]}";
+          });
+          return;
+        }
+
         final reply = data["choices"][0]["message"]["content"];
+        final jsonStr = _extractJson(reply);
 
-        final cleanedReply = _fixMapLinks(reply);
-        // final fullyLinkedReply = _autoLinkKnownPlaces(cleanedReply);
-
-        // _extractRouteDetails(fullyLinkedReply);
-
-        setState(() {
-          _response = cleanedReply;
-          _messages.add({"role": "assistant", "content": cleanedReply});
-        });
-
+        if (jsonStr != null) {
+          try {
+            final itineraryJson = jsonDecode(jsonStr);
+            setState(() {
+              _response = jsonEncode(itineraryJson);
+              _messages.add({"role": "assistant", "content": _response!});
+            });
+            // Run live searches based on the freshly generated itinerary
+            _runLiveSearches(itineraryJson);
+          } catch (_) {
+            try {
+              final repaired = _repairJson(jsonStr);
+              final itineraryJson = jsonDecode(repaired);
+              setState(() {
+                _response = jsonEncode(itineraryJson);
+                _messages.add({"role": "assistant", "content": _response!});
+              });
+              _runLiveSearches(itineraryJson);
+            } catch (_) {
+              setState(() {
+                _response = reply;
+                _messages.add({"role": "assistant", "content": reply});
+              });
+            }
+          }
+        } else {
+          setState(() {
+            _response = reply;
+            _messages.add({"role": "assistant", "content": reply});
+          });
+        }
       } else {
-        setState(() {
-          _response = "Error: ${response.body}";
-        });
+        setState(() => _response = "Error: ${response.body}");
       }
     } catch (e) {
-      setState(() {
-        _response = "Error: $e";
-      });
+      setState(() => _response = "Error: $e");
     }
 
     setState(() => _isLoading = false);
   }
 
-  void _extractRouteDetails(String text) {
-    final startRegex = RegExp(r"Start:\s*(.*)", caseSensitive: false);
-    final endRegex = RegExp(r"End:\s*(.*)", caseSensitive: false);
+  // ===== Live search integration =====
+  Future<void> _runLiveSearches(Map<String, dynamic> itinerary) async {
+    // Derive base location text from title or first tourist spot
+    final String title = (itinerary['title'] ?? '').toString();
+    String base = title;
+    if ((base.isEmpty || base.length < 3) &&
+        itinerary['touristSpots'] is List &&
+        (itinerary['touristSpots'] as List).isNotEmpty) {
+      base = ((itinerary['touristSpots'] as List).first['name'] ?? '').toString();
+    }
 
-    final startMatch = startRegex.firstMatch(text);
-    final endMatch = endRegex.firstMatch(text);
+    final queries = <String, String>{
+      'hotel': 'best hotels in $base',
+      'restaurant': 'best restaurants in $base',
+      'spot': 'top attractions in $base',
+    };
 
-    _origin = startMatch != null ? startMatch.group(1)?.trim() : null;
-    _destination = endMatch != null ? endMatch.group(1)?.trim() : null;
-
-    final waypointsRegex = RegExp(r"\[([^\]]+)\]\(maps://[^\)]+\)");
-    _waypoints = waypointsRegex
-        .allMatches(text)
-        .map((m) => m.group(1)!)
-        .where((p) => p != _origin && p != _destination)
-        .toList();
-  }
-
-  Future<void> _openMaps(String destination) async {
-    final encoded = Uri.encodeComponent(destination);
-
-    final googleUrl = Uri.parse(
-      "https://www.google.com/maps/search/?api=1&query=$encoded",
-    );
-    final appleUrl = Uri.parse("http://maps.apple.com/?q=$encoded");
-
-    final url = Platform.isIOS ? appleUrl : googleUrl;
-
-    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
-      throw Exception("Could not launch $url");
+    for (final entry in queries.entries) {
+      final key = entry.key;
+      final q = entry.value;
+      try {
+        final candidates = await _googleTextSearch(q, limit: 5);
+        if (candidates.isEmpty) continue;
+        final pick = await _groqPickOne(q, candidates);
+        if (pick != null && mounted) {
+          setState(() {
+            _livePicks[key] = pick;
+          });
+        }
+      } catch (_) {
+        // ignore individual query failures
+      }
     }
   }
 
-  Future<void> _openRoute() async {
-    if (_origin == null || _destination == null) return;
+  Future<List<Map<String, dynamic>>> _googleTextSearch(String query, {int limit = 5}) async {
+    final uri = Uri.https('maps.googleapis.com', '/maps/api/place/textsearch/json', {
+      'query': query,
+      'key': _googleApiKey,
+    });
+    final resp = await http.get(uri);
+    if (resp.statusCode != 200) return [];
+    final data = jsonDecode(resp.body);
+    if (data['status'] != 'OK' && data['status'] != 'ZERO_RESULTS') return [];
+    final results = (data['results'] as List? ?? []).cast<dynamic>();
+    return results.take(limit).map<Map<String, dynamic>>((r) => {
+          'name': r['name'],
+          'rating': (r['rating'] is num) ? (r['rating'] as num).toDouble() : null,
+          'user_ratings_total': r['user_ratings_total'],
+          'address': r['formatted_address'] ?? r['vicinity'],
+          'place_id': r['place_id'],
+          'lat': r['geometry']?['location']?['lat'],
+          'lng': r['geometry']?['location']?['lng'],
+        }).toList();
+  }
 
-    final waypointsStr = _waypoints.map(Uri.encodeComponent).join("|");
+  Future<Map<String, dynamic>?> _groqPickOne(String query, List<Map<String, dynamic>> candidates) async {
+    try {
+      final prompt = {
+        'role': 'system',
+        'content': 'You are a concise ranking assistant. Choose the single best candidate strictly based on relevance to the user query and overall quality (rating and number of reviews). Output only valid JSON: {"name":"","place_id":"","reason":"","rating":0,"user_ratings_total":0,"address":"","lat":0,"lng":0}',
+      };
+      final user = {
+        'role': 'user',
+        'content': jsonEncode({
+          'query': query,
+          'candidates': candidates,
+        }),
+      };
+      const apiKey =
+          ""; // same Groq key used above
+      const url = "https://api.groq.com/openai/v1/chat/completions";
+      final response = await http.post(
+        Uri.parse(url),
+        headers: {
+          "Authorization": "Bearer $apiKey",
+          "Content-Type": "application/json",
+        },
+        body: jsonEncode({
+          "model": "llama-3.3-70b-versatile",
+          "messages": [prompt, user],
+        }),
+      );
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body);
+      final reply = data["choices"][0]["message"]["content"];
+      final jsonStr = _extractJson(reply) ?? reply;
+      final parsed = jsonDecode(_repairJson(jsonStr));
+      // Ensure required fields
+      if (parsed is Map && parsed['name'] != null && parsed['place_id'] != null) {
+        return parsed.cast<String, dynamic>();
+      }
+    } catch (_) {}
+    return null;
+  }
 
-    final googleUrl = Uri.parse(
-      "https://www.google.com/maps/dir/?api=1"
-      "&origin=${Uri.encodeComponent(_origin!)}"
-      "&destination=${Uri.encodeComponent(_destination!)}"
-      "&waypoints=$waypointsStr"
-      "&travelmode=driving",
-    );
-
-    final appleUrl = Uri.parse(
-      "http://maps.apple.com/?saddr=${Uri.encodeComponent(_origin!)}&daddr=${Uri.encodeComponent(_destination!)}",
-    );
-
-    final url = Platform.isIOS ? appleUrl : googleUrl;
-
-    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
-      throw Exception("Could not launch $url");
+  Future<void> _saveItinerary() async {
+    if (_response == null) return;
+    try {
+      final itineraryJson = jsonDecode(_response!);
+      final itinerary = Itinerary()
+        ..title = itineraryJson["title"] ?? "Untitled Trip"
+        ..content = _response!
+        ..createdAt = DateTime.now();
+      await isar.writeTxn(() async {
+        await isar.itinerarys.put(itinerary);
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Itinerary saved successfully!")),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Failed to save itinerary: $e")));
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.itinerary?.title ?? 'Plan Trip'),
+        backgroundColor: const Color(0xFF2E6D4D),
+        actions: [
+          if (widget.itinerary != null)
+            IconButton(
+              tooltip: 'Delete',
+              icon: const Icon(Icons.delete),
+              onPressed: _deleteCurrentItinerary,
+            ),
+        ],
+      ),
       backgroundColor: const Color(0xFFF9F6F6),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // HEADER
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text.rich(
-                    TextSpan(
-                      children: [
-                        TextSpan(
-                          text: "Hey Shubham ",
-                          style: TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF2E6D4D),
-                          ),
+        child: Column(
+          children: [
+            Expanded(
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _response != null
+                  ? SingleChildScrollView(
+                      padding: const EdgeInsets.all(20),
+                      child: _buildItineraryView(_response!),
+                    )
+                  : const Center(
+                      child: Text(
+                        "What’s your vision for this trip?",
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
                         ),
-                        TextSpan(text: "👋"),
-                      ],
+                      ),
+                    ),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _tripController,
+                    decoration: const InputDecoration(
+                      hintText: "Describe your trip...",
+                      contentPadding: EdgeInsets.all(12),
                     ),
                   ),
-                  const CircleAvatar(
-                    radius: 18,
-                    backgroundColor: Color(0xFF2E6D4D),
-                    child: Text("S", style: TextStyle(color: Colors.white)),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: () => _getTripPlan(),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.save),
+                  onPressed: _saveItinerary,
+                ),
+              ],
+            ),
+            if (_response != null)
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _followUpController,
+                      decoration: const InputDecoration(
+                        hintText: "Ask follow-up...",
+                        contentPadding: EdgeInsets.all(12),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.send),
+                    onPressed: () {
+                      final text = _followUpController.text.trim();
+                      if (text.isNotEmpty) {
+                        _getTripPlan(followUp: text);
+                        _followUpController.clear();
+                      }
+                    },
                   ),
                 ],
               ),
-              const SizedBox(height: 28),
-
-              Expanded(
-                child: Center(
-                  child: _isLoading
-                      ? Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: const [
-                            CircularProgressIndicator(color: Color(0xFF2E6D4D)),
-                            SizedBox(height: 16),
-                            Text(
-                              "Creating Itinerary...\nCurating a perfect plan for you...",
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 16,
-                                color: Colors.black87,
-                              ),
-                            ),
-                          ],
-                        )
-                      : _response != null
-                      ? SingleChildScrollView(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                "Itinerary Created 🌴",
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.black87,
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-
-                              // Open in Maps (generic query)
-                              GestureDetector(
-                                onTap: () =>
-                                    _openMaps(_tripController.text.trim()),
-                                child: Container(
-                                  padding: const EdgeInsets.all(12),
-                                  decoration: BoxDecoration(
-                                    color: Colors.grey.shade100,
-                                    borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(
-                                      color: Colors.grey.shade300,
-                                    ),
-                                  ),
-                                  child: Row(
-                                    children: const [
-                                      Icon(
-                                        Icons.place,
-                                        color: Colors.redAccent,
-                                      ),
-                                      SizedBox(width: 8),
-                                      Expanded(
-                                        child: Text(
-                                          "Open in Maps",
-                                          style: TextStyle(
-                                            fontSize: 16,
-                                            fontWeight: FontWeight.w500,
-                                          ),
-                                        ),
-                                      ),
-                                      Icon(Icons.arrow_forward_ios, size: 16),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-
-                              // Open full route if available
-                              if (_origin != null && _destination != null)
-                                ElevatedButton.icon(
-                                  onPressed: _openRoute,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFF2E6D4D),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                  ),
-                                  icon: const Icon(
-                                    Icons.map,
-                                    color: Colors.white,
-                                  ),
-                                  label: const Text(
-                                    "Open Full Route in Maps",
-                                    style: TextStyle(color: Colors.white),
-                                  ),
-                                ),
-
-                              const SizedBox(height: 20),
-
-                              // AI Itinerary Output
-                              MarkdownBody(
-                                data: _fixMapLinks(_response!),
-                                onTapLink: (text, href, title) {
-                                  if (href != null && href.startsWith('maps://')) {
-                                    _openMaps(href.substring('maps://'.length));
-                                  }
-                                },
-                                styleSheet: MarkdownStyleSheet(
-                                  h1: const TextStyle(
-                                    fontSize: 22,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.black87,
-                                  ),
-                                  h2: const TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.black87,
-                                  ),
-                                  p: const TextStyle(
-                                    fontSize: 16,
-                                    color: Colors.black87,
-                                  ),
-                                  strong: const TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.black,
-                                  ),
-                                  a: const TextStyle(
-                                    color: Colors.blue,
-                                    decoration: TextDecoration.underline,
-                                  ),
-                                ),
-                              ),
-                              ElevatedButton.icon(
-                                onPressed: () async {
-                                  if (_response != null) {
-                                    final trip = Itinerary()
-                                      ..title = _tripController.text.trim().isNotEmpty
-                                          ? _tripController.text.trim()
-                                          : "Untitled Trip"
-                                      ..content = _response!
-                                      ..createdAt = DateTime.now();
-
-                                    await isar.writeTxn(() async {
-                                      await isar.itinerarys.put(trip);
-                                    });
-
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text("Itinerary saved ✅")),
-                                    );
-                                  }
-                                },
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.green,
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                                ),
-                                icon: const Icon(Icons.save, color: Colors.white),
-                                label: const Text("Save", style: TextStyle(color: Colors.white)),
-                              ),
-                              const SizedBox(height: 24),
-
-                              // Refine button & follow-up
-                              ElevatedButton(
-                                onPressed: () {
-                                  setState(
-                                    () => _showFollowUpBox = !_showFollowUpBox,
-                                  );
-                                },
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF2E6D4D),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                                child: Text(
-                                  _showFollowUpBox
-                                      ? "Cancel Follow-Up"
-                                      : "Refine Itinerary ✨",
-                                  style: const TextStyle(color: Colors.white),
-                                ),
-                              ),
-                              if (_showFollowUpBox) ...[
-                                const SizedBox(height: 16),
-                                TextField(
-                                  controller: _followUpController,
-                                  minLines: 2,
-                                  maxLines: 4,
-                                  decoration: InputDecoration(
-                                    hintText:
-                                        "Add details or refinements (e.g. budget-friendly, hiking)...",
-                                    border: OutlineInputBorder(
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(height: 12),
-                                ElevatedButton(
-                                  onPressed: () {
-                                    final followUp = _followUpController.text
-                                        .trim();
-                                    if (followUp.isNotEmpty) {
-                                      _followUpController.clear();
-                                      _getTripPlan(followUp: followUp);
-                                    }
-                                  },
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFF2E6D4D),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                  ),
-                                  child: const Text(
-                                    "Send Follow-Up",
-                                    style: TextStyle(color: Colors.white),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                        )
-                      : Column(
-                          children: [
-                            const Text(
-                              "What’s your vision\nfor this trip?",
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.black87,
-                              ),
-                            ),
-                            const SizedBox(height: 24),
-
-                            // Input box
-                            Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                border: Border.all(
-                                  color: const Color(0xFF2E6D4D),
-                                ),
-                                borderRadius: BorderRadius.circular(14),
-                                color: Colors.white,
-                              ),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.end,
-                                children: [
-                                  Expanded(
-                                    child: TextField(
-                                      controller: _tripController,
-                                      maxLines: 5,
-                                      minLines: 3,
-                                      decoration: const InputDecoration(
-                                        hintText:
-                                            "Describe your trip (e.g. 7 days in Bali, 3 people, mid-range budget...)",
-                                        border: InputBorder.none,
-                                      ),
-                                      style: const TextStyle(
-                                        fontSize: 15,
-                                        color: Colors.black87,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  IconButton(
-                                    onPressed: () {
-                                      // Speech-to-text placeholder
-                                    },
-                                    icon: const Icon(
-                                      Icons.mic,
-                                      color: Color(0xFF2E6D4D),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 28),
-
-                            // Button
-                            SizedBox(
-                              width: double.infinity,
-                              child: ElevatedButton(
-                                onPressed: _getTripPlan,
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF2E6D4D),
-                                  padding: const EdgeInsets.symmetric(
-                                    vertical: 16,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(16),
-                                  ),
-                                ),
-                                child: const Text(
-                                  "Create My Itinerary",
-                                  style: TextStyle(
-                                    fontSize: 17,
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                ),
-              ),
-            ],
-          ),
+          ],
         ),
       ),
+    );
+  }
+
+  Widget _buildItineraryView(String jsonStr) {
+    final itinerary = jsonDecode(jsonStr);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          itinerary["title"],
+          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+        ),
+        Text(
+          "${itinerary["startDate"]} → ${itinerary["endDate"]}",
+          style: const TextStyle(color: Colors.grey),
+        ),
+        const SizedBox(height: 12),
+
+        // Live suggestions section
+        if (_livePicks.isNotEmpty) ...[
+          const Text(
+            'Live suggestions',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 6),
+          ...['hotel', 'restaurant', 'spot'].where((k) => _livePicks[k] != null).map((k) {
+            final p = _livePicks[k]!;
+            final mapsUrl = 'https://www.google.com/maps/place/?q=place_id:${p['place_id']}';
+            return Card(
+              child: ListTile(
+                leading: Icon(k == 'hotel' ? Icons.hotel : k == 'restaurant' ? Icons.restaurant : Icons.place),
+                title: Text(p['name'] ?? ''),
+                subtitle: Text([
+                  if (p['rating'] != null) 'Rating: ${p['rating']} (${p['user_ratings_total'] ?? 0})',
+                  if (p['address'] != null) p['address'],
+                ].whereType<String>().join('\n')),
+                trailing: IconButton(
+                  icon: const Icon(Icons.map),
+                  onPressed: () => _launch(Uri.parse(mapsUrl)),
+                ),
+              ),
+            );
+          }),
+          const SizedBox(height: 12),
+        ],
+
+        ...List.generate(itinerary["days"].length, (i) {
+          final day = itinerary["days"][i];
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                "Day ${i + 1}: ${day["summary"]}",
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              ...day["items"].map<Widget>((item) {
+                final loc = item["location"];
+                final label = item["activity"];
+                return ListTile(
+                  onTap: () => _openInMaps(loc, label: label),
+                  leading: Text(item["time"]),
+                  title: Text(item["activity"]),
+                  subtitle: Text(
+                    loc,
+                    style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline),
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.map),
+                    onPressed: () => _openInMaps(loc, label: label),
+                  ),
+                );
+              }),
+
+              const Divider(),
+            ],
+          );
+        }),
+
+        if (itinerary["hotels"] != null && itinerary["hotels"].isNotEmpty) ...[
+          const Text(
+            "Hotels",
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          ...itinerary["hotels"].map<Widget>((h) => ListTile(
+            onTap: () => _openInMaps(h["location"], label: h["name"]),
+            title: Text(h["name"]),
+            subtitle: Text("₹${h["pricePerNight"]} • ${h["location"]}",
+                style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
+            trailing: IconButton(
+              icon: const Icon(Icons.map),
+              onPressed: () => _openInMaps(h["location"], label: h["name"]),
+            ),
+          )),
+        ],
+
+        if (itinerary["touristSpots"] != null &&
+            itinerary["touristSpots"].isNotEmpty) ...[
+          const Text(
+            "Tourist Spots",
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          ...itinerary["touristSpots"].map<Widget>((s) => ListTile(
+            onTap: () => _openInMaps(s["location"], label: s["name"]),
+            title: Text(s["name"]),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(s["description"]),
+                Text(s["location"],
+                    style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
+              ],
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.map),
+              onPressed: () => _openInMaps(s["location"], label: s["name"]),
+            ),
+          )),
+        ],
+
+        if (itinerary["food"] != null && itinerary["food"].isNotEmpty) ...[
+          const Text(
+            "Food",
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          ...itinerary["food"].map<Widget>((f) => ListTile(
+            onTap: () => _openInMaps(f["location"], label: f["name"]),
+            title: Text(f["name"]),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("${f["cuisine"]} • ₹${f["avgCost"]}"),
+                Text(f["location"],
+                    style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
+              ],
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.map),
+              onPressed: () => _openInMaps(f["location"], label: f["name"]),
+            ),
+          )),
+        ],
+
+        if (itinerary["transportOptions"] != null &&
+            itinerary["transportOptions"].isNotEmpty) ...[
+          const Text(
+            "Transport",
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          ...itinerary["transportOptions"].map<Widget>(
+            (t) => ListTile(
+              title: Text("${t["mode"]} • ${t["provider"]}"),
+              subtitle: Text("₹${t["approxCost"]} • ${t["duration"]}"),
+            ),
+          ),
+        ],
+
+        if (itinerary["estimatedBudget"] != null) ...[
+          const Text(
+            "Estimated Budget",
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          Text(
+            "Accommodation: ₹${itinerary["estimatedBudget"]["accommodation"]}",
+          ),
+          Text("Food: ₹${itinerary["estimatedBudget"]["food"]}"),
+          Text("Transport: ₹${itinerary["estimatedBudget"]["transport"]}"),
+          Text("Activities: ₹${itinerary["estimatedBudget"]["activities"]}"),
+          Text("Total: ₹${itinerary["estimatedBudget"]["total"]}"),
+        ],
+
+        const SizedBox(height: 20),
+        ElevatedButton.icon(
+          onPressed: () {
+            String? destination;
+            if (itinerary["touristSpots"] != null &&
+                itinerary["touristSpots"].isNotEmpty) {
+              destination = itinerary["touristSpots"].last["location"];
+            } else if (itinerary["days"].isNotEmpty &&
+                itinerary["days"].last["items"].isNotEmpty) {
+              destination = itinerary["days"].last["items"].last["location"];
+            }
+            if (destination != null) {
+              _openRouteInMaps(destination); // starts from current location
+            }
+          },
+          icon: const Icon(Icons.directions),
+          label: const Text("Open Route in Maps"),
+        ),
+      ],
     );
   }
 }
