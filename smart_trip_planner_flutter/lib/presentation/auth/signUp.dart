@@ -27,7 +27,6 @@ class _SignUpPageState extends State<SignUpPage> {
     return Column(
       children: [
         const SizedBox(height: 18),
-        // small plane + App name row
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: const [
@@ -38,18 +37,17 @@ class _SignUpPageState extends State<SignUpPage> {
               style: TextStyle(
                 fontWeight: FontWeight.w700,
                 fontSize: 22,
-                color: Color(0xFF0E6A45), // deep green
+                color: Color(0xFF0E6A45),
               ),
             ),
           ],
         ),
         const SizedBox(height: 28),
-        // Title
         const Text(
           'Create your Account',
           textAlign: TextAlign.center,
           style: TextStyle(
-            color: Color(0xFF0B2340), // dark navy-ish heading
+            color: Color(0xFF0B2340),
             fontSize: 30,
             fontWeight: FontWeight.w800,
           ),
@@ -85,7 +83,6 @@ class _SignUpPageState extends State<SignUpPage> {
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Placeholder for Google logo. Replace with AssetImage or network image for exact logo.
             Container(
               width: 28,
               height: 28,
@@ -233,16 +230,13 @@ class _SignUpPageState extends State<SignUpPage> {
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 16),
           decoration: BoxDecoration(
-            // color: const Color(0xFF1F6A4E), // deep green
             borderRadius: BorderRadius.circular(20),
             // boxShadow: [
-            //   // soft dark shadow
             //   BoxShadow(
             //     color: const Color(0xFF0B2640).withOpacity(0.12),
             //     offset: const Offset(0, 6),
             //     blurRadius: 12,
             //   ),
-            //   // subtle purple glow to mimic screenshot's shadow
             //   BoxShadow(
             //     color: const Color(0xFF7A6BFF).withOpacity(0.12),
             //     offset: const Offset(0, 10),
@@ -253,10 +247,9 @@ class _SignUpPageState extends State<SignUpPage> {
           child: Center(
             child: ElevatedButton(
               onPressed: () {
-                // TODO: handle signup logic
               },
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF1F6A4E), // green background
+                backgroundColor: const Color(0xFF1F6A4E),
                 padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 32),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(20),
@@ -299,7 +292,6 @@ class _SignUpPageState extends State<SignUpPage> {
   @override
   Widget build(BuildContext context) {
     final w = MediaQuery.of(context).size.width;
-    // central column with padding left/right similar to screenshot (large side paddings)
     return Scaffold(
       body: SafeArea(
         child: SingleChildScrollView(
@@ -311,7 +303,6 @@ class _SignUpPageState extends State<SignUpPage> {
                 _buildHeader(w),
                 _googleButton(context),
                 _orDivider(),
-                // Email / Password fields in a soft card area (we keep background same; spacing & grouping as screenshot)
                 const SizedBox(height: 6),
                 _emailField(),
                 const SizedBox(height: 18),

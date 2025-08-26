@@ -1,121 +1,17 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:url_launcher/url_launcher.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 
+import '../../core/constants.dart';
+import '../../core/error_utils.dart';
+import '../../core/utils.dart';
 import '../../data/model/itinerary.dart';
 import '../../main.dart';
 
-const String _systemPrompt = """
-You are a smart trip planner assistant.
 
-Rules:
-1. Your ONLY output must be valid JSON following this schema:
 
-{
-  "title": "Trip Title",
-  "startDate": "YYYY-MM-DD",
-  "endDate": "YYYY-MM-DD",
-  "days": [
-    {
-      "date": "YYYY-MM-DD",
-      "summary": "Day summary",
-      "items": [
-        { "time": "HH:MM", "activity": "Activity description", "location": "lat,lng" }
-      ]
-    }
-  ],
-  "hotels": [
-    { "name": "Hotel name", "pricePerNight": 100, "location": "lat,lng" }
-  ],
-  "touristSpots": [
-    { "name": "Spot name", "location": "lat,lng", "description": "Short description" }
-  ],
-  "food": [
-    { "name": "Restaurant or street food", "cuisine": "Indian/Italian/etc", "avgCost": 15, "location": "lat,lng" }
-  ],
-  "transportOptions": [
-    { "mode": "flight/train/bus/cab", "provider": "Airline/Bus/Taxi/etc", "approxCost": 50, "duration": "2h 30m" }
-  ],
-  "estimatedBudget": {
-    "currency": "INR",
-    "accommodation": 0,
-    "food": 0,
-    "transport": 0,
-    "activities": 0,
-    "total": 0
-  }
-}
-
-2. Do NOT include Markdown, explanations, or extra text. Only return valid JSON.
-3. Every `location` must be in "lat,lng" format.
-4. All budget numbers must be realistic estimates in Indian Rupees (not all zeros).
-5. "hotels", "touristSpots", "food", "transportOptions", and "estimatedBudget" are required but can be empty arrays/objects if not applicable.
-""";
-
-String? _extractJson(String text) {
-  final start = text.indexOf("{");
-  final end = text.lastIndexOf("}");
-  if (start != -1 && end != -1 && end > start) {
-    return text.substring(start, end + 1);
-  }
-  return null;
-}
-
-String _repairJson(String jsonStr) {
-  return jsonStr
-      .replaceAllMapped(RegExp(r'"(\w+)"\s*,\s*'), (m) => '"${m[1]}": ')
-      .replaceAll(",}", "}")
-      .replaceAll(",]", "]");
-}
-
-/// Helper to open coordinates in Maps
-/// Try to launch a Uri; returns true if something opened.
-Future<bool> _launch(Uri uri) async {
-  if (await canLaunchUrl(uri)) {
-    return await launchUrl(uri, mode: LaunchMode.externalApplication);
-  }
-  return false;
-}
-
-/// Open coordinates in Maps (native first, then web)
-Future<void> _openInMaps(String latLng, {String? label}) async {
-  final clean = latLng.replaceAll(' ', '');
-  final q = label == null ? clean : '$clean($label)';
-
-  final attempts = <Uri>[
-    if (Platform.isIOS) Uri.parse('maps://?q=$q'), // Apple Maps (app)
-    if (Platform.isAndroid) Uri.parse('geo:$clean?q=$q'), // Any maps app
-    Uri.https('www.google.com', '/maps/search/', {'api': '1', 'query': q}),
-    Uri.https('maps.apple.com', '/', {'q': q}),
-  ];
-
-  for (final u in attempts) {
-    if (await _launch(u)) return;
-  }
-}
-
-/// Open route from current location → destination
-Future<void> _openRouteInMaps(String destinationLatLng) async {
-  final dest = destinationLatLng.replaceAll(' ', '');
-
-  final attempts = <Uri>[
-    if (Platform.isIOS)
-      Uri.parse('maps://?daddr=$dest&dirflg=d'), // Apple Maps driving
-    if (Platform.isAndroid)
-      Uri.parse('google.navigation:q=$dest&mode=d'), // Google Maps nav
-    Uri.https('www.google.com', '/maps/dir/', {
-      'api': '1',
-      'destination': dest,
-    }),
-    Uri.https('maps.apple.com', '/', {'daddr': dest, 'dirflg': 'd'}),
-  ];
-
-  for (final u in attempts) {
-    if (await _launch(u)) return;
-  }
-}
 
 class ItineraryScreen extends StatefulWidget {
   final Itinerary? itinerary;
@@ -132,12 +28,10 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
   List<Map<String, String>> _messages = [];
   String? _response;
   bool _isLoading = false;
-  // Live suggestions picked by Groq from Google top 5 results
   Map<String, Map<String, dynamic>> _livePicks = {};
 
-  // Google API Key (provided by user)
-  static const String _googleApiKey =
-      '';
+  bool _offline = false;
+  StreamSubscription<List<ConnectivityResult>>? _connSub;
 
   Future<void> _deleteCurrentItinerary() async {
     final it = widget.itinerary;
@@ -162,14 +56,21 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
     );
 
     if (confirm == true) {
-      await isar.writeTxn(() async {
-        await isar.itinerarys.delete(it.id);
-      });
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Itinerary deleted')),
-      );
-      Navigator.of(context).pop();
+      try {
+        await isar.writeTxn(() async {
+          await isar.itinerarys.delete(it.id);
+        });
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Itinerary deleted')),
+        );
+        Navigator.of(context).pop();
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to delete itinerary: $e')),
+        );
+      }
     }
   }
 
@@ -177,8 +78,16 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
   void initState() {
     super.initState();
     _messages = [
-      {"role": "system", "content": _systemPrompt},
+      {"role": "system", "content": systemPrompt},
     ];
+    ErrorUtils.hasConnectivity().then((has) {
+      if (mounted) setState(() => _offline = !has);
+    });
+    _connSub = Connectivity().onConnectivityChanged.listen((results) {
+      // results
+      final off = results.contains(ConnectivityResult.none);
+      if (mounted) setState(() => _offline = off);
+    });
     if (widget.itinerary != null) {
       _response = widget.itinerary!.content;
       _tripController.text = widget.itinerary!.title;
@@ -186,7 +95,6 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
         {"role": "user", "content": widget.itinerary!.title},
         {"role": "assistant", "content": _response!},
       ]);
-      // Kick off live searches for saved itinerary
       try {
         final itJson = jsonDecode(_response!);
         _runLiveSearches(itJson);
@@ -194,12 +102,31 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
     }
   }
 
+  @override
+  void dispose() {
+    _connSub?.cancel();
+    super.dispose();
+  }
+
   Future<void> _getTripPlan({String? followUp}) async {
+    if (followUp == null && _tripController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please describe your trip first.')),
+      );
+      return;
+    }
+
+    if (!await ErrorUtils.hasConnectivity()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No internet connection.')),
+      );
+      return;
+    }
+
     setState(() => _isLoading = true);
 
-    const apiKey =
-        ""; // <-- replace
-    const url = "https://api.groq.com/openai/v1/chat/completions";
+    const apiKey = groqApiKey;
+    const url = groqUrl;
 
     if (followUp == null) {
       _messages.add({"role": "user", "content": _tripController.text.trim()});
@@ -208,7 +135,7 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
     }
 
     try {
-      final response = await http.post(
+      final response = await ErrorUtils.withTimeout(http.post(
         Uri.parse(url),
         headers: {
           "Authorization": "Bearer $apiKey",
@@ -218,7 +145,7 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           "model": "llama-3.3-70b-versatile",
           "messages": _messages,
         }),
-      );
+      ));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -231,7 +158,7 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
         }
 
         final reply = data["choices"][0]["message"]["content"];
-        final jsonStr = _extractJson(reply);
+        final jsonStr = extractJson(reply);
 
         if (jsonStr != null) {
           try {
@@ -240,11 +167,10 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
               _response = jsonEncode(itineraryJson);
               _messages.add({"role": "assistant", "content": _response!});
             });
-            // Run live searches based on the freshly generated itinerary
             _runLiveSearches(itineraryJson);
           } catch (_) {
             try {
-              final repaired = _repairJson(jsonStr);
+              final repaired = repairJson(jsonStr);
               final itineraryJson = jsonDecode(repaired);
               setState(() {
                 _response = jsonEncode(itineraryJson);
@@ -265,18 +191,28 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           });
         }
       } else {
-        setState(() => _response = "Error: ${response.body}");
+        final msg = ErrorUtils.httpStatusMessage(response.statusCode);
+        setState(() => _response = "Error: $msg\n${response.body}");
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg)),
+        );
       }
+    } on TimeoutException {
+      setState(() => _response = "Error: Request timed out.");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Request timed out. Please try again.')),
+      );
     } catch (e) {
       setState(() => _response = "Error: $e");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to get trip plan.')),
+      );
     }
 
     setState(() => _isLoading = false);
   }
 
-  // ===== Live search integration =====
   Future<void> _runLiveSearches(Map<String, dynamic> itinerary) async {
-    // Derive base location text from title or first tourist spot
     final String title = (itinerary['title'] ?? '').toString();
     String base = title;
     if ((base.isEmpty || base.length < 3) &&
@@ -304,20 +240,43 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           });
         }
       } catch (_) {
-        // ignore individual query failures
       }
     }
   }
 
   Future<List<Map<String, dynamic>>> _googleTextSearch(String query, {int limit = 5}) async {
+    if (!await ErrorUtils.hasConnectivity()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No internet connection.')),
+      );
+      return [];
+    }
     final uri = Uri.https('maps.googleapis.com', '/maps/api/place/textsearch/json', {
       'query': query,
-      'key': _googleApiKey,
+      'key': googleApiKey,
     });
-    final resp = await http.get(uri);
-    if (resp.statusCode != 200) return [];
+    final resp = await ErrorUtils.withTimeout(http.get(uri));
+    if (resp.statusCode != 200) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(ErrorUtils.httpStatusMessage(resp.statusCode, provider: 'google'))),
+      );
+      return [];
+    }
     final data = jsonDecode(resp.body);
-    if (data['status'] != 'OK' && data['status'] != 'ZERO_RESULTS') return [];
+    if (data['status'] != 'OK' && data['status'] != 'ZERO_RESULTS') {
+
+        String status = ErrorUtils.googlePlacesStatusMessage(data['status']);
+        if(status == null || status == ''){
+          // ScaffoldMessenger.of(context).showSnackBar(
+          // SnackBar(content: Text(ErrorUtils.googlePlacesStatusMessage(data['status'].toString()))));
+        }
+        else{
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(ErrorUtils.googlePlacesStatusMessage(data['status'].toString()))),
+          );
+        }
+      return [];
+    }
     final results = (data['results'] as List? ?? []).cast<dynamic>();
     return results.take(limit).map<Map<String, dynamic>>((r) => {
           'name': r['name'],
@@ -343,10 +302,11 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           'candidates': candidates,
         }),
       };
-      const apiKey =
-          ""; // same Groq key used above
-      const url = "https://api.groq.com/openai/v1/chat/completions";
-      final response = await http.post(
+      const apiKey = groqApiKey;
+      const url = groqUrl;
+      if (!await ErrorUtils.hasConnectivity()) return null;
+
+      final response = await ErrorUtils.withTimeout(http.post(
         Uri.parse(url),
         headers: {
           "Authorization": "Bearer $apiKey",
@@ -356,13 +316,19 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           "model": "llama-3.3-70b-versatile",
           "messages": [prompt, user],
         }),
-      );
-      if (response.statusCode != 200) return null;
+      ));
+      if (response.statusCode != 200) {
+        return null;
+      }
       final data = jsonDecode(response.body);
       final reply = data["choices"][0]["message"]["content"];
-      final jsonStr = _extractJson(reply) ?? reply;
-      final parsed = jsonDecode(_repairJson(jsonStr));
-      // Ensure required fields
+      final jsonStr = extractJson(reply) ?? reply;
+      Map<String, dynamic> parsed;
+      try {
+        parsed = jsonDecode(repairJson(jsonStr));
+      } catch (_) {
+        return null;
+      }
       if (parsed is Map && parsed['name'] != null && parsed['place_id'] != null) {
         return parsed.cast<String, dynamic>();
       }
@@ -374,16 +340,27 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
     if (_response == null) return;
     try {
       final itineraryJson = jsonDecode(_response!);
-      final itinerary = Itinerary()
-        ..title = itineraryJson["title"] ?? "Untitled Trip"
-        ..content = _response!
+
+      final existing = widget.itinerary;
+
+      final itinerary = existing ?? Itinerary()
         ..createdAt = DateTime.now();
+
+      itinerary
+        ..title = itineraryJson["title"] ?? "Untitled Trip"
+        ..content = _response!;
+
       await isar.writeTxn(() async {
         await isar.itinerarys.put(itinerary);
       });
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Itinerary saved successfully!")),
+          SnackBar(
+            content: Text(existing == null
+                ? "Itinerary saved successfully!"
+                : "Itinerary updated successfully!"),
+          ),
         );
       }
     } catch (e) {
@@ -397,7 +374,7 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.itinerary?.title ?? 'Plan Trip'),
+        title: Text(widget.itinerary?.title ?? 'Plan Trip', style: TextStyle(color: Colors.white),),
         backgroundColor: const Color(0xFF2E6D4D),
         actions: [
           if (widget.itinerary != null)
@@ -412,6 +389,17 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
       body: SafeArea(
         child: Column(
           children: [
+            if (_offline)
+              Container(
+                width: double.infinity,
+                color: Colors.red.shade600,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: const Text(
+                  'You are offline. Some features are unavailable.',
+                  style: TextStyle(color: Colors.white),
+                  textAlign: TextAlign.center,
+                ),
+              ),
             Expanded(
               child: _isLoading
                   ? const Center(child: CircularProgressIndicator())
@@ -430,28 +418,29 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
                       ),
                     ),
             ),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _tripController,
-                    decoration: const InputDecoration(
-                      hintText: "Describe your trip...",
-                      contentPadding: EdgeInsets.all(12),
+            if (_response == null)
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _tripController,
+                      decoration: const InputDecoration(
+                        hintText: "Describe your trip...",
+                        contentPadding: EdgeInsets.all(12),
+                      ),
                     ),
                   ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.send),
-                  onPressed: () => _getTripPlan(),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.save),
-                  onPressed: _saveItinerary,
-                ),
-              ],
-            ),
-            if (_response != null)
+                  IconButton(
+                    icon: const Icon(Icons.send),
+                    onPressed: _offline
+                        ? () => ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('You are offline. Please reconnect.')),
+                            )
+                        : () => _getTripPlan(),
+                  ),
+                ],
+              )
+            else
               Row(
                 children: [
                   Expanded(
@@ -465,13 +454,21 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
                   ),
                   IconButton(
                     icon: const Icon(Icons.send),
-                    onPressed: () {
-                      final text = _followUpController.text.trim();
-                      if (text.isNotEmpty) {
-                        _getTripPlan(followUp: text);
-                        _followUpController.clear();
-                      }
-                    },
+                    onPressed: _offline
+                        ? () => ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('You are offline. Please reconnect.')),
+                            )
+                        : () {
+                            final text = _followUpController.text.trim();
+                            if (text.isNotEmpty) {
+                              _getTripPlan(followUp: text);
+                              _followUpController.clear();
+                            }
+                          },
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.save),
+                    onPressed: _saveItinerary,
                   ),
                 ],
               ),
@@ -497,7 +494,6 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
         ),
         const SizedBox(height: 12),
 
-        // Live suggestions section
         if (_livePicks.isNotEmpty) ...[
           const Text(
             'Live suggestions',
@@ -506,7 +502,6 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
           const SizedBox(height: 6),
           ...['hotel', 'restaurant', 'spot'].where((k) => _livePicks[k] != null).map((k) {
             final p = _livePicks[k]!;
-            final mapsUrl = 'https://www.google.com/maps/place/?q=place_id:${p['place_id']}';
             return Card(
               child: ListTile(
                 leading: Icon(k == 'hotel' ? Icons.hotel : k == 'restaurant' ? Icons.restaurant : Icons.place),
@@ -515,10 +510,6 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
                   if (p['rating'] != null) 'Rating: ${p['rating']} (${p['user_ratings_total'] ?? 0})',
                   if (p['address'] != null) p['address'],
                 ].whereType<String>().join('\n')),
-                trailing: IconButton(
-                  icon: const Icon(Icons.map),
-                  onPressed: () => _launch(Uri.parse(mapsUrl)),
-                ),
               ),
             );
           }),
@@ -541,16 +532,11 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
                 final loc = item["location"];
                 final label = item["activity"];
                 return ListTile(
-                  onTap: () => _openInMaps(loc, label: label),
                   leading: Text(item["time"]),
                   title: Text(item["activity"]),
                   subtitle: Text(
                     loc,
-                    style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline),
-                  ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.map),
-                    onPressed: () => _openInMaps(loc, label: label),
+                    style: const TextStyle(color: Colors.black87),
                   ),
                 );
               }),
@@ -566,14 +552,9 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
           ...itinerary["hotels"].map<Widget>((h) => ListTile(
-            onTap: () => _openInMaps(h["location"], label: h["name"]),
             title: Text(h["name"]),
             subtitle: Text("₹${h["pricePerNight"]} • ${h["location"]}",
-                style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
-            trailing: IconButton(
-              icon: const Icon(Icons.map),
-              onPressed: () => _openInMaps(h["location"], label: h["name"]),
-            ),
+                style: const TextStyle(color: Colors.black87)),
           )),
         ],
 
@@ -584,19 +565,14 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
           ...itinerary["touristSpots"].map<Widget>((s) => ListTile(
-            onTap: () => _openInMaps(s["location"], label: s["name"]),
             title: Text(s["name"]),
             subtitle: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(s["description"]),
                 Text(s["location"],
-                    style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
+                    style: const TextStyle(color: Colors.black87)),
               ],
-            ),
-            trailing: IconButton(
-              icon: const Icon(Icons.map),
-              onPressed: () => _openInMaps(s["location"], label: s["name"]),
             ),
           )),
         ],
@@ -607,19 +583,14 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
           ...itinerary["food"].map<Widget>((f) => ListTile(
-            onTap: () => _openInMaps(f["location"], label: f["name"]),
             title: Text(f["name"]),
             subtitle: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text("${f["cuisine"]} • ₹${f["avgCost"]}"),
                 Text(f["location"],
-                    style: const TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
+                    style: const TextStyle(color: Colors.black87)),
               ],
-            ),
-            trailing: IconButton(
-              icon: const Icon(Icons.map),
-              onPressed: () => _openInMaps(f["location"], label: f["name"]),
             ),
           )),
         ],
@@ -655,17 +626,21 @@ class _ItineraryScreenState extends State<ItineraryScreen> {
         const SizedBox(height: 20),
         ElevatedButton.icon(
           onPressed: () {
-            String? destination;
-            if (itinerary["touristSpots"] != null &&
-                itinerary["touristSpots"].isNotEmpty) {
-              destination = itinerary["touristSpots"].last["location"];
-            } else if (itinerary["days"].isNotEmpty &&
-                itinerary["days"].last["items"].isNotEmpty) {
-              destination = itinerary["days"].last["items"].last["location"];
-            }
-            if (destination != null) {
-              _openRouteInMaps(destination); // starts from current location
-            }
+            final title = itinerary['title']?.toString() ?? '';
+            final cities = extractCitiesFromTitle(title);
+            
+            final origin = findOrigin(itinerary);
+            final dest = findDestination(itinerary);
+            
+            openRouteInMaps(
+              context,
+              originCity: cities?.first,
+              destCity: cities?.last,
+              originLat: origin?.elementAt(0),
+              originLng: origin?.elementAt(1),
+              destLat: dest?.elementAt(0),
+              destLng: dest?.elementAt(1),
+            );
           },
           icon: const Icon(Icons.directions),
           label: const Text("Open Route in Maps"),

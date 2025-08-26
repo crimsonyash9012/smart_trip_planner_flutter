@@ -16,8 +16,17 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Itinerary> itineraries = [];
 
   Future<void> _loadItineraries() async {
-    final allTrips = await isar.itinerarys.where().findAll();
-    setState(() => itineraries = allTrips);
+    try {
+      final allTrips = await isar.itinerarys.where().findAll();
+      if (mounted) {
+        setState(() => itineraries = allTrips);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to load itineraries: $e')),
+      );
+    }
   }
 
   @override

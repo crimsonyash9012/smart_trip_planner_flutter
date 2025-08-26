@@ -6,14 +6,13 @@ class LoginScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF9F6F6), // light off-white bg
+      backgroundColor: const Color(0xFFF9F6F6),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              // Logo
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: const [
@@ -24,14 +23,13 @@ class LoginScreen extends StatelessWidget {
                     style: TextStyle(
                       fontSize: 22,
                       fontWeight: FontWeight.bold,
-                      color: Color(0xFF2E6D4D), // dark green
+                      color: Color(0xFF2E6D4D), 
                     ),
                   ),
                 ],
               ),
               const SizedBox(height: 32),
 
-              // Header
               const Text(
                 "Hi, Welcome Back",
                 style: TextStyle(
@@ -50,15 +48,10 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 32),
 
-              // Google Sign-in Button
               SizedBox(
                 width: double.infinity,
                 child: OutlinedButton.icon(
                   onPressed: () {},
-                  // icon: Image.network(
-                  //   "https://upload.wikimedia.org/wikipedia/commons/5/53/Google_%22G%22_Logo.svg",
-                  //   height: 22,
-                  // ),
                   label: const Text(
                     "Sign in with Google",
                     style: TextStyle(
@@ -79,7 +72,6 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 20),
 
-              // Divider
               Row(
                 children: const [
                   Expanded(child: Divider(color: Colors.grey)),
@@ -95,7 +87,6 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 20),
 
-              // Email
               TextField(
                 decoration: InputDecoration(
                   labelText: "Email address",
@@ -107,7 +98,6 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
 
-              // Password
               TextField(
                 obscureText: true,
                 decoration: InputDecoration(
@@ -121,7 +111,6 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 12),
 
-              // Remember + Forgot
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
@@ -155,7 +144,6 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 24),
 
-              // Login Button
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
